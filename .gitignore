@@ -1,7 +1,8 @@
-# knit output
+# knit output stays local. index.html is the password-protected copy served by GitHub Pages
 *_cache/
 *_files/
 *.html
+!index.html
 
 # R session files
 .Rhistory
