@@ -1,0 +1,12 @@
+# knit output
+*_cache/
+*_files/
+*.html
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# raw NLS extract stays local for now (unzip nlsy79_core_wealth.zip into data/)
+data/

@@ -1,0 +1,725 @@
+---
+title: "NLSY79 wealth trajectories: working notes, build order steps 1 to 6"
+author: "Gabriella Carmona"
+date: "started Nov 11, 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      fig.width = 8, fig.height = 4.5)
+```
+
+These are my running notes for the class project / book chapter analysis. Not a write-up. I'm going through the first six steps of the build order from the analysis plan and writing down what I see, what worries me, and what I need to come back to. Everything here is unweighted and nothing is adjusted for education or family background yet, so none of the gaps below are "the" finding.
+
+Build order, for my own reference:
+
+1. describe the data before modeling
+2. unconditional means model (how much variance is between people)
+3. linear age + random slope
+4. pick the shape (spline first, then compare)
+5. group differences in intercept and slopes
+6. residual structure (independent vs continuous-time AR1, variance by age)
+
+```{r packages}
+library(tidyverse)
+library(lme4)
+library(nlme)
+library(splines)
+
+theme_set(theme_minimal(base_size = 12))
+data_dir <- "data"   # unzip nlsy79_core_wealth.zip here
+```
+
+# The extract
+
+Pulled Nov 11 2026 from NLS Investigator as a guest (NLSY79 1979-2022 release). The zip has a csv with reference numbers as column names, a .sdf file that maps reference numbers to question names and years, a codebook (.cdb), and the tagset (.NLSY79) in case I need to re-pull. 12,686 rows, 116 columns.
+
+What's in it: CASEID, HHID, birth month/year, country of birth (FAM-2A), first ethnic origin and closest ethnic origin (FAM-30_1, FAM-31), SAMPLE_ID, SAMPLE_RACE, SAMPLE_SEX, and then by year TNFW_TRUNC (17 years), AGEATINT (30), SAMPWEIGHT (30), RNI (29).
+
+The Investigator also gives an R script that renames everything but it is 76 KB of hard-coded names. I'd rather build the lookup from the .sdf.
+
+```{r read}
+raw <- read_csv(file.path(data_dir, "nlsy79_core_wealth.csv"), show_col_types = FALSE)
+
+dict <- tibble(line = read_lines(file.path(data_dir, "nlsy79_core_wealth.sdf"))) |>
+  filter(str_detect(line, "^[A-Z]\\d{5}\\.\\d{2}")) |>
+  mutate(rnum  = str_remove(str_sub(line, 1, 9), "\\."),
+         year  = str_trim(str_sub(line, 19, 26)),
+         qname = str_trim(str_extract(line, "\\S+\\s*$"))) |>
+  select(rnum, year, qname)
+
+count(dict, qname)
+dim(raw)
+```
+
+Person-level stuff first, then the yearly variables go long.
+
+```{r reshape}
+person <- raw |>
+  transmute(id = R0000100, hhid = R0000149,
+            byear = 1900 + R0000500,
+            cob = R0000700,             # 1 = US, 2 = other country, -3 = invalid skip
+            origin1 = R0009600,
+            origin_close = R0010200,
+            sample_id = R0173600,
+            cohort = R0214700,          # 1 Hispanic, 2 Black, 3 non-Black non-Hispanic
+            sex = R0214800)
+
+yearly <- raw |>
+  pivot_longer(-R0000100, names_to = "rnum", values_to = "val") |>
+  inner_join(filter(dict, qname %in% c("TNFW_TRUNC", "AGEATINT", "SAMPWEIGHT", "RNI")),
+             by = "rnum") |>
+  transmute(id = R0000100, year = as.integer(year), qname, val) |>
+  pivot_wider(names_from = qname, values_from = val)
+
+d <- left_join(yearly, person, by = "id")
+```
+
+## Missing codes
+
+NLS uses negative codes: -1 refusal, -2 don't know, -3 invalid skip, -4 valid skip, -5 noninterview. For TNFW_TRUNC the codebook says real negative values start at -6, so -1 to -5 are safe to treat as missing. Important thing I didn't appreciate until I tabulated it: -3 on net worth means the person WAS interviewed but NLS could not build the total because at least one asset or debt piece was missing. They don't impute.
+
+```{r missing-codes}
+d |>
+  filter(!is.na(TNFW_TRUNC)) |>
+  mutate(code = if_else(TNFW_TRUNC %in% -5:-1, as.character(TNFW_TRUNC), "valid")) |>
+  count(year, code) |>
+  pivot_wider(names_from = code, values_from = n, values_fill = 0)
+```
+
+So in 1998 there are 2,060 people who did the interview and have no wealth total. That's about a quarter of everyone interviewed that year. Every year it's somewhere between 700 and 2,000. This is a second kind of missingness on top of attrition and I had only been thinking about attrition. Need to look at which component is usually the missing one (probably need the component variables for that, stage C download).
+
+```{r recode}
+d <- d |>
+  mutate(across(c(TNFW_TRUNC, AGEATINT, SAMPWEIGHT), \(x) if_else(x %in% -5:-1, NA_real_, x)),
+         RNI = if_else(RNI == -4, NA_real_, RNI))
+```
+
+## Who stays in the analysis sample
+
+Two subsamples were dropped by NLS partway through (military after 1984, the "poor white" supplemental sample after 1990). If I leave them in, they look like massive attrition for the white group. Dropping all of them. That includes the 201 military cases NLS actually kept, which is simpler than figuring out which ones those are. Revisit if I need the n.
+
+```{r sample}
+d <- d |>
+  mutate(samp = case_when(sample_id %in% 1:8             ~ "cross-section",
+                          sample_id %in% c(10, 11, 13, 14) ~ "supplemental Black/Hispanic",
+                          sample_id %in% c(9, 12)         ~ "supplemental poor white (dropped 1990)",
+                          TRUE                            ~ "military (dropped 1984)"),
+         group = factor(cohort, levels = c(3, 1, 2), labels = c("White", "Hispanic", "Black")))
+
+d |> distinct(id, samp, group) |> count(samp, group) |>
+  pivot_wider(names_from = group, values_from = n, values_fill = 0)
+
+a <- filter(d, str_detect(samp, "cross|Black/Hispanic"))
+n_distinct(a$id)
+```
+
+9,763 people: 4,916 "White", 1,924 Hispanic, 2,923 Black.
+
+"White" is in quotes because the screener category is really non-Black, non-Hispanic. It includes people who gave Asian, Pacific Islander, or Native American as their origin in 1979. Quick look at how many:
+
+```{r white-check}
+a |>
+  distinct(id, group, origin1) |>
+  filter(group == "White") |>
+  mutate(origin_type = case_when(
+    origin1 %in% c(3, 5, 6, 7, 11, 12, 22, 23, 24, 25, 27) ~ "European",
+    origin1 == 29 ~ "'American'",
+    origin1 %in% c(0, 28) | origin1 < 0 ~ "other / none / missing",
+    origin1 == 9 ~ "Native American",
+    origin1 %in% c(2, 4, 8, 10, 13, 14, 26) ~ "Asian / Pacific Islander",
+    origin1 == 1 ~ "Black",
+    origin1 %in% 15:21 ~ "Hispanic origin")) |>
+  count(origin_type, sort = TRUE)
+```
+
+This uses first origin only (FAM-30_1), not the "closest" one, so it won't match the documentation table exactly. Good enough to see the size of the issue. The Native American count is suspicious, the codebook itself says it was probably overstated in 1979. For now the comparison group is the whole screener category. TODO: rerun step 5 with European + "American" only and see if anything moves. About 7% of the group gave a clearly non-European first origin, and another 14% said "American", other, or nothing. I doubt dropping the 7% changes much but the 14% is a judgment call.
+
+Also "Hispanic" here is the screener assignment (n = 2,002 before dropping military), not self-identified origin. Same TODO.
+
+## Real dollars
+
+CPI-U annual averages, typed in from the BLS / Minneapolis Fed table. Everything goes to 2020 dollars. I checked the values against the Minneapolis Fed page but should replace this with a proper download so nobody has to trust my typing.
+
+```{r cpi}
+cpi <- tribble(~year, ~cpi,
+  1985, 107.6, 1986, 109.6, 1987, 113.6, 1988, 118.3, 1989, 124.0, 1990, 130.7,
+  1992, 140.3, 1993, 144.5, 1994, 148.2, 1996, 156.9, 1998, 163.0, 2000, 172.2,
+  2004, 188.9, 2008, 215.3, 2012, 229.6, 2016, 240.0, 2020, 258.8)
+
+w <- a |>
+  inner_join(cpi, by = "year") |>      # keeps only the 17 asset years
+  mutate(nw = TNFW_TRUNC * 258.8 / cpi,
+         age = AGEATINT)
+```
+
+One wrinkle: the 2020 round was fielded into 2021 and I'm deflating by survey year, not interview date. Small.
+
+# Step 1. Describe before modeling
+
+## What happens to people in each wealth year
+
+```{r status}
+status <- w |>
+  mutate(status = case_when(!is.na(nw)  ~ "has net worth",
+                            !is.na(age) ~ "interviewed, no total",
+                            TRUE        ~ "not interviewed")) |>
+  count(group, year, status) |>
+  group_by(group, year) |>
+  mutate(share = n / sum(n)) |>
+  ungroup()
+
+ggplot(status, aes(year, share, fill = status)) +
+  geom_col() +
+  facet_wrap(~group) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+```{r status-table}
+status |>
+  filter(group == "Hispanic", year %in% c(1985, 1990, 1998, 2008, 2020)) |>
+  select(year, status, share) |>
+  mutate(share = round(share, 3)) |>
+  pivot_wider(names_from = status, values_from = share)
+```
+
+Hispanic sample: 87% have a usable net worth in 1985, 64% in 1998, 57% in 2020. The three groups look pretty similar on this, which I did not expect. I thought the Hispanic sample would lose more people. The "interviewed, no total" slice is biggest in the mid to late 90s for everyone (18% of the Hispanic sample in 1998), right when NLS added the retirement account questions. Probably not a coincidence: more items to refuse or not know.
+
+What the "not interviewed" people are in 2020, since deaths are a different thing than refusals:
+
+```{r rni-2020}
+a |>
+  filter(year == 2020, !is.na(RNI)) |>
+  mutate(reason = case_when(RNI == 65 ~ "deceased",
+                            RNI %in% c(61, 71, 77) ~ "refusal",
+                            RNI == 64 ~ "can't locate",
+                            TRUE ~ "other (unavailable, not fielded)")) |>
+  count(group, reason) |>
+  group_by(group) |>
+  mutate(share_of_noninterviews = round(n / sum(n), 2)) |>
+  ungroup()
+```
+
+Deaths are about a third of Hispanic non-interviews (32%), 28% of white, and half of Black (49%). So for Black respondents attrition is much more about mortality, and for the other two groups it's mostly refusals. Those are different missing data problems. RNI is "final disposition at end of fielding" so the deceased count is a floor. People who died after a refusal still show as refusals.
+
+## The person-wave file
+
+```{r person-wave}
+pw <- w |>
+  filter(!is.na(nw), !is.na(age)) |>
+  arrange(id, year)
+
+nrow(pw); n_distinct(pw$id)
+sum(!is.na(w$nw) & is.na(w$age))   # wealth but no age
+```
+
+Two person-waves in 1994 have a wealth total but no AGEATINT. Dropped, not worth fixing.
+
+```{r waves-per-person}
+pw |>
+  count(id, group, name = "waves") |>
+  group_by(group) |>
+  summarise(people = n(), median_waves = median(waves),
+            one_wave = sum(waves == 1), ten_plus = sum(waves >= 10))
+```
+
+This is better than I feared. Median person has 14 of the 17 wealth waves. 1,879 Hispanic respondents have at least one, 1,509 have ten or more. 226 people in the analysis sample never have a usable total and just drop out of everything below.
+
+How thin is it past 50? This matters for whether a late-career piece is even estimable.
+
+```{r after-50}
+pw |>
+  filter(age >= 50) |>
+  count(id, group) |>
+  group_by(group) |>
+  summarise(people = n(), median_waves = median(n), max_waves = max(n))
+```
+
+Median of 2 waves after 50, max 4. So anything I say about "late career" rests on about two observations per person. For people born in 1963 or 1964 it is exactly 2016 and 2020 and nothing else. Keep this in mind in step 4.
+
+## Data problems I ran into
+
+**A minus one billion.** I only caught this because the white mean for ages 45 to 49 came out lower than the median, which can't happen with this kind of skew unless something is very wrong.
+
+```{r billion}
+pw |> filter(TNFW_TRUNC < -1e6) |> select(id, year, age, group, TNFW_TRUNC)
+```
+
+Case 4523 in 2008 has net worth of -1,000,000,000. That has to be a placeholder or a keying error. The other four are large but believable (business debt, underwater property in 2008). Dropping the one observation. I should email NLS user services about it, and check whether it's in the errata.
+
+```{r drop-billion}
+pw <- filter(pw, TNFW_TRUNC > -1e8)
+```
+
+This is also a warning about means in general with this variable. One bad row took the white 45 to 49 mean from about $435k down to $107k.
+
+**Age doesn't always match birth year.** AGEATINT should be survey year minus birth year, give or take one.
+
+```{r age-check}
+pw |> mutate(diff = age - (year - byear)) |> count(diff)
+```
+
+About 350 person-waves are off by two or more years. Most are -2 or -3. My guess is these are people whose birth date was corrected after 1979 (I pulled the 1979 birth year) or interviews that ran very late. It's 0.3% of rows. Leaving AGEATINT as is for now. TODO: pull the 1981 date of birth variables and see if that clears it up.
+
+**Top-codes.** The codebook says the top 2% each year share one value.
+
+```{r topcode}
+pw |>
+  group_by(year) |>
+  summarise(topcode_nominal = max(TNFW_TRUNC),
+            n_at_top = sum(TNFW_TRUNC == max(TNFW_TRUNC)),
+            n_at_top_hispanic = sum(TNFW_TRUNC == max(TNFW_TRUNC) & group == "Hispanic"))
+```
+
+The 2020 top value is $16.4 million, up from $5.4 million in 2016, so the top code tripled in one wave. Any analysis in raw dollars will be sensitive to that. On a log-type scale it matters much less. Hispanic respondents are about 20% of this sample but only around 10% of the top-coded cases in most years, so top-coding compresses the white distribution about twice as hard. That would make a gap in means look smaller than it is, if I ever use means.
+
+## What wealth looks like by age and group
+
+Medians in 2020 dollars. Medians because of everything above.
+
+```{r medians-age, fig.height=4}
+age_meds <- pw |>
+  mutate(age_band = cut(age, seq(19, 64, 5),
+                        labels = paste(seq(20, 60, 5), seq(24, 64, 5), sep = "-"))) |>
+  group_by(group, age_band) |>
+  summarise(n = n(), median = median(nw), p25 = quantile(nw, .25), p75 = quantile(nw, .75),
+            zero_or_neg = mean(nw <= 0), .groups = "drop")
+
+ggplot(age_meds, aes(age_band, median, color = group, group = group)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(x = "age", y = "median net worth (2020 $)", color = NULL)
+
+age_meds |> select(group, age_band, n, median, zero_or_neg) |>
+  mutate(median = round(median), zero_or_neg = round(zero_or_neg, 2))
+```
+
+Raw picture, before any model:
+
+- White median goes from about $7k in the early 20s to $315k in the early 60s. Hispanic from $3.6k to $96k. Black from $1.3k to $13k.
+- The gap is there at 20 to 24 already and it's roughly 2 to 1. By the early 40s it's more like 3.6 to 1 and it stays around 3 to 1 after that. So in ratio terms most of the widening happens before 40. In dollar terms it keeps growing the whole time, obviously.
+- The Black trajectory barely moves after the early 40s. That's a different story than the Hispanic one and I should be careful not to describe "Black and Latino" wealth as one pattern in the chapter.
+- Share at zero or below: 30% of Hispanic person-waves in the early 20s, still 18% in the early 60s. White is 20% falling to 8%. A lot of mass at or below zero, which is going to be a problem for any transformation.
+
+Same thing by survey year instead of age, because I want to see 2008.
+
+```{r medians-year, fig.height=4}
+pw |>
+  group_by(group, year) |>
+  summarise(median = median(nw), .groups = "drop") |>
+  ggplot(aes(year, median, color = group)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(x = "survey year", y = "median net worth (2020 $)", color = NULL)
+```
+
+There it is. Everyone drops between 2008 and 2012. White median falls about 13%, Hispanic about 19%, Black about half. The cohort was 43 to 56 across those two waves. So any "mid-career" flattening I see by age is at least partly the Great Recession, and I can't separate them with age alone because everyone in this cohort went through 2008 within the same 8-year age window. This is the age/period problem from the plan showing up in the first plot I made.
+
+Also the 2008 interviews happened across 2008 and into 2009, so the 2008 wave is a mix of before and after the crash. Check interview dates later.
+
+## Individual trajectories
+
+```{r spaghetti, fig.height=4.5}
+set.seed(1979)
+ids <- pw |> distinct(id, group) |> group_by(group) |> slice_sample(n = 40) |> pull(id)
+
+pw |>
+  filter(id %in% ids) |>
+  ggplot(aes(age, nw / 1000, group = id)) +
+  geom_line(alpha = .35) +
+  facet_wrap(~group) +
+  coord_cartesian(ylim = c(-200, 1500)) +
+  labs(y = "net worth, $1000s (2020 $)")
+```
+
+40 random people per group, y axis cut at $1.5M. Individual lines are jumpy. People go up and down by hundreds of thousands between waves. Some of that is real (home sale, divorce, business) and some has to be reporting noise, and I can't tell which. Most Hispanic and Black lines hug the bottom.
+
+## Picking a scale
+
+```{r scale, fig.height=3.5}
+pw <- pw |>
+  mutate(ihs_d = asinh(nw),            # IHS of dollars
+         ihs_k = asinh(nw / 1000))     # IHS of thousands of dollars
+
+pw |>
+  select(`raw dollars` = nw, `asinh(dollars)` = ihs_d, `asinh($1000s)` = ihs_k) |>
+  pivot_longer(everything()) |>
+  ggplot(aes(value)) +
+  geom_histogram(bins = 80) +
+  facet_wrap(~name, scales = "free") +
+  labs(x = NULL, y = NULL)
+```
+
+The plan says inverse hyperbolic sine. Looking at it, the unit matters a lot more than I assumed.
+
+With asinh of dollars, zero maps to 0 and $1,000 maps to 7.6. So going from nothing to $1,000 is the same distance as going from $1,000 to about $2 million. With 20 to 30% of some groups at or below zero, that one jump would drive the whole model. The histogram shows it: a spike at 0, a gap, then a hump, then a mirror hump for negatives.
+
+With asinh of $1000s, zero to $1,000 is 0.88 and the distribution is at least one connected thing, though still lumpy at zero.
+
+Going with thousands (`ihs_k`) for now. But I want it on record that this is a choice and the results depend on it. The ICC below changes from .44 to .34 just from switching units. This is the Chen and Roth point from my week 2 notes and it's not a footnote here. Rank-based version has to be run before I believe any of this.
+
+# Step 2. Unconditional means
+
+```{r setup-models}
+pw <- pw |> mutate(age_c = (age - 25) / 10)   # 0 = age 25, 1 unit = a decade
+
+# default optimizer threw a convergence warning (max|grad| = 0.048) when I
+# recentered age in step 3. bobyqa doesn't.
+ctl <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+```
+
+```{r m0}
+m0 <- lmer(ihs_k ~ 1 + (1 | id), pw, REML = FALSE, control = ctl)
+vc0 <- as.data.frame(VarCorr(m0))
+vc0
+vc0$vcov[1] / sum(vc0$vcov)
+
+# same thing on the dollars scale, to see how much the unit matters
+m0_d <- lmer(ihs_d ~ 1 + (1 | id), pw, REML = FALSE, control = ctl)
+vcd <- as.data.frame(VarCorr(m0_d)); vcd$vcov[1] / sum(vcd$vcov)
+```
+
+ICC is 0.44. So 44% of the variance in (transformed) wealth is stable differences between people and 56% is within people over time. That within part is mostly growth, which is the point of the next step, so this number isn't very interesting on its own.
+
+On the dollars scale the ICC is 0.34. Lower because the zero spike adds a lot of within-person noise (somebody at $0 one wave and $2,000 the next looks like a huge swing).
+
+# Step 3. Linear age, random slope
+
+Age is centered at 25 and in decades, so the intercept is wealth at 25 and the slope is change per ten years. I used decades so the slope variance isn't tiny next to the intercept variance.
+
+```{r m1}
+m_lin <- lmer(ihs_k ~ age_c + (age_c | id), pw, REML = FALSE, control = ctl)
+summary(m_lin)$coefficients
+VarCorr(m_lin)
+```
+
+Average is 2.42 at age 25, going up 0.69 per decade. People differ a lot in both: SD of 1.85 on the intercept and 0.86 on the slope, so plenty of people have flat or negative slopes.
+
+Intercept-slope correlation is basically zero (-0.03). Taken at face value: where you are at 25 says nothing about how fast you accumulate. That sounded wrong, so I did the recentering check from week 1 (Biesanz).
+
+```{r m1-recenter}
+pw <- pw |> mutate(age_c55 = (age - 55) / 10)
+m_lin55 <- lmer(ihs_k ~ age_c55 + (age_c55 | id), pw, REML = FALSE, control = ctl)
+VarCorr(m_lin55)
+```
+
+Centered at 55 the correlation is 0.81, and the SD of levels goes from 1.85 at 25 to 3.13 at 55. Same model, same fit. So the lines fan out a lot over 30 years. Variance in wealth nearly triples between 25 and 55 on this scale. People who are higher at 55 are the ones who grew faster, which is almost a tautology, but the fanning out is real and it's the within-cohort inequality story.
+
+Note to self for the write-up: never say "intercept-slope correlation" without saying at what age.
+
+Also this is a linear model and the next step shows linear is wrong, so don't over-read any of these numbers.
+
+# Step 4. Shape
+
+Plan says fit the spline first to see where the curve bends, then pick knots from that.
+
+Tried `mgcv::gamm()` with a person random effect and it asked for 8.6 GB of memory and died. `bam()` with a random effect smooth also ran out. 120k rows and 9.5k people is too much for those on a machine with 7 or 8 GB. So for now this is a natural cubic spline basis inside `lmer`, which is a regression spline, not a penalized one. With this much data per age I doubt the penalty would change the mean curve, but it's not what the plan said and I should say so in class. Could try `gamm4` or fit the penalized version on a random subsample of people.
+
+```{r spline}
+kn <- c(27, 32, 38, 45, 53)   # spread over the age range, a bit denser where most of the data is
+m_ns <- lmer(ihs_k ~ ns(age, knots = kn, Boundary.knots = c(20, 64)) + (age_c | id),
+             pw, REML = FALSE, control = ctl)
+
+curve <- tibble(age = 20:64, age_c = (age - 25) / 10)
+curve$fit <- predict(m_ns, curve, re.form = NA)
+curve$slope_per_year <- c(NA, diff(curve$fit))
+
+ggplot(curve, aes(age, fit)) + geom_line() +
+  labs(y = "predicted asinh(net worth in $1000s)", title = "Pooled spline, all three groups")
+
+curve |> filter(age %in% c(21, 25, 30, 35, 38, 40, 43, 46, 49, 52, 55, 60, 64)) |>
+  mutate(across(c(fit, slope_per_year), \(x) round(x, 2)))
+```
+
+Not what I expected. I had early / mid / late career in my head with knots at 35 and 50. What the data show:
+
+- steep in the early 20s (0.15 to 0.18 a year), then a steady 0.10 to 0.12 a year from the late 20s to about 38
+- slows through the early 40s and is flat by 45 or 46
+- slightly negative from 47 to 51
+- picks up again from about 53 and is back to 0.10 a year by 60
+
+The dip in the late 40s is the 2008 to 2012 drop from the year plot. It lines up exactly: this cohort was 43 to 56 in those waves. So the "shape of the age trajectory" has the recession baked into it and the second bend is where the recovery starts, not a career stage. If I call the flat stretch "mid-career" I'm mislabeling a period effect.
+
+Where do the data want the knots? Brute force, one knot at a time.
+
+```{r knot-grid}
+one_knot <- tibble(knot = 26:50) |>
+  mutate(BIC = map_dbl(knot, \(k) {
+    dat <- mutate(pw, a_k = pmax(age - k, 0) / 10)
+    BIC(lmer(ihs_k ~ age_c + a_k + (age_c | id), dat, REML = FALSE, control = ctl))
+  }))
+
+ggplot(one_knot, aes(knot, BIC)) + geom_line() + geom_point()
+slice_min(one_knot, BIC, n = 3)
+```
+
+Best single knot is 39, with 38 and 40 close. Not 35.
+
+```{r two-knots}
+two_knot <- expand_grid(k1 = c(36, 38, 40, 42), k2 = c(48, 50, 52, 54, 56)) |>
+  mutate(BIC = map2_dbl(k1, k2, \(k1, k2) {
+    dat <- mutate(pw, a1 = pmax(age - k1, 0) / 10, a2 = pmax(age - k2, 0) / 10)
+    BIC(lmer(ihs_k ~ age_c + a1 + a2 + (age_c | id), dat, REML = FALSE, control = ctl))
+  }))
+
+two_knot |> mutate(BIC = round(BIC)) |> pivot_wider(names_from = k2, values_from = BIC)
+```
+
+Best pair on this grid is 42 and 52, with 40 and 52 only 10 BIC points behind. Going with 40 and 52 because they're round and I picked the grid by eye anyway. Now everything side by side:
+
+```{r shape-compare}
+pw <- pw |>
+  mutate(a35 = pmax(age - 35, 0) / 10, a50 = pmax(age - 50, 0) / 10,
+         a40 = pmax(age - 40, 0) / 10, a52 = pmax(age - 52, 0) / 10)
+
+m_quad   <- lmer(ihs_k ~ age_c + I(age_c^2) + (age_c | id), pw, REML = FALSE, control = ctl)
+m_p3550  <- lmer(ihs_k ~ age_c + a35 + a50 + (age_c | id), pw, REML = FALSE, control = ctl)
+m_p4052  <- lmer(ihs_k ~ age_c + a40 + a52 + (age_c | id), pw, REML = FALSE, control = ctl)
+
+tibble(model = c("linear", "quadratic", "piecewise 35/50 (my original)", "piecewise 40/52", "spline, 5 knots"),
+       fixed_params = c(2, 3, 4, 4, 7),
+       BIC = map_dbl(list(m_lin, m_quad, m_p3550, m_p4052, m_ns), BIC)) |>
+  mutate(BIC = round(BIC), vs_best = BIC - min(BIC))
+
+fixef(m_p4052)
+```
+
+Things to take from this:
+
+- My original 35/50 knots do no better than a plain quadratic. Worse, actually, by BIC. So the knots I wrote into the plan before seeing data were not good.
+- 40/52 beats the quadratic by about 230 and is only about 30 behind the spline with three fewer parameters.
+- Pooled slopes with 40/52: +1.18 per decade up to 40, then basically zero (1.18 - 1.24) from 40 to 52, then +0.58 per decade after.
+
+I'll carry 40/52 forward as the piecewise model. But two caveats I need to keep attached to it:
+
+1. I chose the knots by looking at this same data. BIC comparisons after that are optimistic. Fine for description, not fine to present as a test.
+2. The 40 to 52 piece is mostly a recession piece. A cleaner model probably has age pieces plus a period term for 2008 and after. That's on the sensitivity list in the plan (post-2008 indicator) but after seeing this I think it belongs in the main model, not a robustness check. Ask about this.
+
+All of these still have a single random slope for age. I haven't tried letting the pieces have their own random slopes.
+
+# Step 5. Group differences
+
+```{r group-model}
+m_g0 <- lmer(ihs_k ~ age_c + a40 + a52 + group + (age_c | id), pw, REML = FALSE, control = ctl)
+m_g  <- lmer(ihs_k ~ (age_c + a40 + a52) * group + (age_c | id), pw, REML = FALSE, control = ctl)
+
+anova(m_g0, m_g)
+round(summary(m_g)$coefficients, 3)
+VarCorr(m_g)
+```
+
+Letting the slopes differ by group is a big improvement (chi-square around 413 on 6 df), no surprise.
+
+Reading the Hispanic rows against White:
+
+- at 25: -0.72. Already behind.
+- before 40: slope is 0.43 per decade lower. So the gap grows by 0.43 every ten years through the 20s and 30s.
+- 40 to 52: the a40 interaction is +0.43, which cancels the slope difference almost exactly. Gap stops growing. Both groups are flat here (recession years).
+- after 52: +0.12 with a standard error of 0.17. Can't say anything. Two waves per person.
+
+Black rows: bigger starting gap (-1.36), bigger slope gap before 40 (-0.68 per decade), and after 52 the Black slope is lower again (-0.52). So Black respondents don't share in the post-2012 recovery the way the other two groups do. Again, different pattern from the Hispanic one.
+
+Gaps at specific ages, since the later slopes don't mean much on their own:
+
+```{r gaps}
+newd <- expand_grid(age = c(25, 30, 35, 40, 50, 60), group = levels(pw$group)) |>
+  mutate(group = factor(group, levels = levels(pw$group)),
+         age_c = (age - 25) / 10, a40 = pmax(age - 40, 0) / 10, a52 = pmax(age - 52, 0) / 10)
+newd$fit <- predict(m_g, newd, re.form = NA)
+
+gaps <- newd |>
+  select(age, group, fit) |>
+  pivot_wider(names_from = group, values_from = fit) |>
+  mutate(hisp_gap = Hispanic - White, black_gap = Black - White)
+gaps |> mutate(across(-age, \(x) round(x, 2)))
+```
+
+Hispanic gap: -0.72 at 25, -0.93 at 30, -1.15 at 35, -1.37 at 40, -1.37 at 50, about -1.28 at 60. For values well above zero a difference of d on this scale is roughly a ratio of exp(d), so -1.37 is Hispanic typical wealth at about a quarter of white typical wealth. That lines up with the raw medians being 3 to 4 to 1.
+
+So the short version of sub-question 1 right now: the gap exists at career entry, about doubles (on this scale) between 25 and 40, and then holds. That's consistent with Killewald and Bryan finding the 30s matter most. It's not consistent with a story where the gap keeps widening through late career, at least not in relative terms.
+
+## Dollars: the back-transformation problem
+
+The plan says report predicted trajectories converted back to dollars. I tried it.
+
+```{r backtransform}
+newd |>
+  mutate(dollars = round(sinh(fit) * 1000)) |>
+  select(age, group, dollars) |>
+  pivot_wider(names_from = group, values_from = dollars)
+```
+
+This doesn't work. Model says a typical white respondent at 60 has about $117k. The raw median for whites in their late 50s is around $250k and over $300k in the early 60s. The model number is less than half the median.
+
+Why: the model predicts the mean of asinh(wealth). With a big chunk of people at zero or negative, that mean gets dragged way down, and sinh of a mean is not the mean or the median of anything. It's some kind of typical value that weights the zeros heavily.
+
+So I can't put sinh(prediction) in the chapter as "predicted wealth". Options I can think of: (a) report gaps on the transformed scale and show raw medians next to them for the dollar intuition, (b) model percentile rank instead, where the units are honest, (c) quantile regression at the median, which loses the random effects. Leaning (b) as the main model for the chapter and keeping this one for class. Need to think about it more. This is a bigger deal than a sensitivity check.
+
+## Spline difference curve
+
+For "where does the gap open" without relying on my knots. Same regression spline as step 4, interacted with group. Simultaneous band by simulating from the fixed effect covariance matrix (the Ruppert / Suk et al. approach from week 3), so I can read along the whole curve and not just at one age.
+
+```{r spline-diff}
+m_ns_g <- lmer(ihs_k ~ ns(age, knots = kn, Boundary.knots = c(20, 64)) * group + (age_c | id),
+               pw, REML = FALSE, control = ctl)
+c(piecewise = BIC(m_g), spline = BIC(m_ns_g))
+
+grid <- tibble(age = seq(20, 64, by = 0.5))
+mm <- function(g) model.matrix(~ ns(age, knots = kn, Boundary.knots = c(20, 64)) * group,
+                               mutate(grid, group = factor(g, levels = levels(pw$group))))
+V <- as.matrix(vcov(m_ns_g))
+b <- fixef(m_ns_g)
+
+diff_curve <- function(g) {
+  D   <- mm(g) - mm("White")
+  est <- as.vector(D %*% b)
+  se  <- sqrt(diag(D %*% V %*% t(D)))
+  set.seed(79)
+  sims <- MASS::mvrnorm(5000, rep(0, length(b)), V)
+  crit <- quantile(apply(abs(sims %*% t(D)) %*% diag(1 / se), 1, max), .95)
+  tibble(group = g, age = grid$age, est, lo = est - crit * se, hi = est + crit * se, crit = crit)
+}
+dc <- bind_rows(diff_curve("Hispanic"), diff_curve("Black"))
+
+ggplot(dc, aes(age, est, color = group, fill = group)) +
+  geom_hline(yintercept = 0, linewidth = .3) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .2, color = NA) +
+  geom_line() +
+  labs(y = "difference from White, asinh($1000s)", color = NULL, fill = NULL,
+       title = "Gap by age, with 95% simultaneous bands")
+
+dc |> filter(group == "Hispanic", age %in% c(20, 25, 30, 35, 40, 45, 50, 55, 60, 64)) |>
+  mutate(across(c(est, lo, hi), \(x) round(x, 2))) |> select(age, est, lo, hi)
+```
+
+Hispanic curve: about -0.3 at 20 (band just barely excludes zero), -0.7 at 25, -1.2 at 35, -1.3 at 40, then sits between -1.3 and -1.4 through 55, and comes back up a bit to around -1.0 by 64. The band at 64 is wide (roughly -1.5 to -0.5) so I can't claim the gap narrows at the end. Could also be who's left in the sample at 64. Only the oldest birth years get there by 2020.
+
+Agrees with the piecewise read. The gap opens between 20 and 40. Whatever is happening, it's happening early.
+
+The spline model also fits better than piecewise by about 75 BIC points, so the piecewise is losing something, probably the early 20s steepness.
+
+One thing bugging me: the gap at age 20 is small and grows fast through the early 20s. Is that real, or is it that at 20 to 22 almost everybody has almost nothing so there's no room for a gap on this scale? Probably both. The raw medians at 20 to 24 are $7k vs $3.6k. Also only the youngest birth cohorts are observed at 20 to 22 (wealth starts in 1985), so the left end of the curve is 1962 to 1964 births only. Cohort and age are tangled at both ends.
+
+# Step 6. Residual structure
+
+Switching to `nlme::lme` because lme4 can't do correlated residuals. Waves are 1 to 4 years apart so it has to be the continuous-time AR(1), `corCAR1`, with time in years. Same fixed effects and random effects as `m_g`.
+
+```{r lme-ind}
+pw <- pw |> arrange(id, year) |> mutate(yr = year - 1985)
+
+l_ind <- lme(ihs_k ~ (age_c + a40 + a52) * group, random = ~ age_c | id,
+             data = pw, method = "ML", control = lmeControl(opt = "optim"))
+```
+
+```{r lme-car, cache=TRUE}
+l_car <- update(l_ind, correlation = corCAR1(form = ~ yr | id))
+```
+
+```{r lme-compare}
+anova(l_ind, l_car)
+l_car$modelStruct$corStruct
+VarCorr(l_ind)
+VarCorr(l_car)
+```
+
+Phi is 0.41. Residuals one year apart correlate 0.41, two years apart 0.17, four years apart 0.03. So a shock mostly fades within a few years. That's less persistence than I would have guessed for wealth. With the later waves 4 years apart the AR part is doing almost nothing after 2000, it's all coming from the annual waves in 1985 to 1994.
+
+Fit improves a lot (likelihood ratio over 5,000 for one parameter).
+
+And the Blozis and Craft thing happens: the random effect variances move. Intercept variance goes from 2.96 to 2.44, slope variance from 0.69 to 0.54. About a fifth of what looked like stable individual differences in growth was short-run persistence. The intercept-slope correlation also flips sign, from -0.10 to +0.06, both basically zero.
+
+There's a warning about a singular precision matrix in one block. I think that's one person whose observations give nlme trouble. Need to find out who block 2139 is.
+
+```{r lme-fixed}
+round(cbind(independent = fixef(l_ind), car1 = fixef(l_car),
+            se_ind = summary(l_ind)$tTable[, 2], se_car = summary(l_car)$tTable[, 2]), 3)
+```
+
+Fixed effects barely change. Hispanic slope difference before 40 goes from -0.43 to -0.41. Standard errors go up a little (0.041 to 0.046 on that term). So the group story from step 5 holds and the main effect of fixing the residuals is on the variance components, same as the reading said.
+
+## Does residual variance change with age?
+
+`varExp` on age errored out with NaNs when combined with `corCAR1`, and so did `varIdent` when I used the optim optimizer. What worked: `varIdent` by age range with the default optimizer (nlminb) and the iteration limit raised, since it hit the default limit the first time. It takes about 4 minutes, so it's cached.
+
+```{r lme-var, cache=TRUE}
+pw <- pw |> mutate(phase = cut(age, c(19, 29, 39, 51, 65), labels = c("20s", "30s", "40-51", "52+")))
+
+l_cv <- lme(ihs_k ~ (age_c + a40 + a52) * group, random = ~ age_c | id,
+            data = pw, method = "ML",
+            correlation = corCAR1(value = 0.4, form = ~ yr | id),
+            weights = varIdent(form = ~ 1 | phase),
+            control = lmeControl(maxIter = 200, msMaxIter = 200))  # default 50 iterations wasn't enough
+```
+
+```{r lme-var-out}
+l_cv$modelStruct$varStruct
+c(car1 = BIC(l_car), car1_plus_var = BIC(l_cv))
+```
+
+Residual SD relative to the 20s: 0.94 in the 30s, 1.04 in the 40s, 0.93 after 52. BIC likes it (about 250 better) but with 120k rows BIC likes everything. The differences are a few percent. On this scale the residual spread is about the same at every age, and the fixed effects don't move. Not worth carrying. If I go to the location-scale idea from week 8, the interesting question would be variance by group, not by age, and I haven't done that yet.
+
+## Residuals are not normal
+
+```{r resid, fig.height=3.5}
+r <- resid(l_car, type = "normalized")
+c(skew = mean(r^3) / sd(r)^3, kurtosis = mean(r^4) / sd(r)^4)
+
+tibble(r = r) |> ggplot(aes(sample = r)) + geom_qq(alpha = .1) + geom_qq_line()
+```
+
+Skew around -1.2, kurtosis over 7. Long left tail. Those are the zero and negative net worth observations sitting far below people's own lines. The transformation fixed the right tail and created a left one. Fixed effects are probably okay with this many observations but the variance components and anything built on normality of the random effects (like a growth mixture model later) are suspect. One more reason to run ranks.
+
+# Where this leaves me
+
+Things that held up:
+
+- Sample is in better shape than I expected. 1,879 Hispanic respondents with wealth data, median 14 waves, attrition similar across groups.
+- Gap is present at career entry and roughly doubles on the transformed scale between 25 and 40, then holds. Both the piecewise model and the spline say this.
+- Residuals are autocorrelated (phi about 0.4 per year), and modeling that shrinks the random effect variances by about a fifth without changing the group differences.
+
+Things that changed from the plan:
+
+- Knots at 35 and 50 were wrong. Data say about 40 and 52.
+- The 40 to 52 flat stretch is the Great Recession, not a career stage. Period needs to be in the main model.
+- Converting predictions back to dollars gives numbers that are less than half the raw medians. Can't report those.
+- Penalized spline wouldn't fit in memory, used a regression spline.
+- Variance by age is a non-issue on this scale.
+
+Open problems, roughly in order of how much they worry me:
+
+1. The scale. asinh results depend on the unit, residuals have a heavy left tail, and dollars don't come back out. Rerun steps 2 to 6 on within-wave percentile rank.
+2. Age vs period. Add a post-2008 term, or year effects, and see what happens to the 40/52 pieces.
+3. Missing totals among people who were interviewed (up to a quarter of interviews in 1998). Who are they? If it's people with complicated assets, the top is missing. If it's people who don't know their debts, the bottom is.
+4. I looked at whether leavers started out poorer (below) and they didn't, which is reassuring but crude.
+5. Nothing is weighted. The cross-section and supplemental Hispanic samples are pooled as if they were one.
+6. Siblings. Haven't added the household level (step 9).
+7. "White" and "Hispanic" are screener categories. Rerun with self-identified origin.
+8. The -1e9 case, the age mismatches, the singular block in nlme. Small but should be run down.
+9. Wealth is family net worth. Marriage and divorce move it and I have no marital status in this extract. That's in the stage B download.
+
+```{r leavers}
+early <- pw |> filter(year <= 1990) |> group_by(id, group) |> summarise(early = median(nw), .groups = "drop")
+late  <- pw |> filter(year >= 2012) |> distinct(id) |> mutate(has_late = TRUE)
+
+early |>
+  left_join(late, by = "id") |>
+  mutate(has_late = coalesce(has_late, FALSE)) |>
+  group_by(group, has_late) |>
+  summarise(people = n(), median_early_wealth = round(median(early)), .groups = "drop")
+```
+
+Median 1985 to 1990 wealth for people with no wealth data after 2010 vs people who have some. For Hispanic and Black respondents the leavers actually started a little higher. For white respondents no real difference. So it isn't the poorest who disappear, at least not by this measure. This lumps together death, refusal and missing totals, which could each go a different direction.
+
+Next: stage B download (education, family background, job variables, marital status), then steps 7 to 9. Before that, redo this file on ranks.
+
+```{r session}
+sessionInfo()
+```
